@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from .allocation import allocate
 from .disputes_service import lock_chain_roots
+from .errors import APIError
 from .payments_service import lock_holders_for_billing
 
 # 咨询锁：使用单 bigint 键，高 32 位为服务命名空间、低 32 位为期间键
@@ -95,6 +96,33 @@ def _period_lock_key(key: str) -> int:
     n = int.from_bytes(digest, "big", signed=False)
     # 转成 int8 有符号数
     return n - (1 << 64) if n >= (1 << 63) else n
+
+
+def lock_period(conn, start: datetime, end: datetime) -> str:
+    """取"期间事务咨询锁"：关账、解除与出单按期间在此锁上完全串行。
+
+    返回期间规范化键；调用方须在事务内持有至提交。
+    """
+    _s, _e, key = canonical_period(start, end)
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(%s::bigint)",
+        (_combined_key(ADVISORY_NS, _period_lock_key(key)),),
+    )
+    return key
+
+
+def _get_period_closing(conn, start: datetime, end: datetime, *, for_update=False):
+    """读取期间关账记录（如存在）。for_update=True 时对行加锁。"""
+    return conn.execute(
+        f"""
+        SELECT id, close_ref, period_start, period_end, latest_batch_id,
+               pending_count, status, closed_at, released_at
+        FROM period_closings
+        WHERE period_start = %s AND period_end = %s
+        {'FOR UPDATE' if for_update else ''}
+        """,
+        (start, end),
+    ).fetchone()
 
 
 def _pending_payload(rows) -> list[dict]:
@@ -510,6 +538,23 @@ def issue_statement(conn, start_in: datetime, end_in: datetime):
             (_combined_key(ADVISORY_NS, _period_lock_key(key)),),
         )
 
+        # 关账后该期间拒绝出单（关账/解除与出单按期间串行；
+        # 关账先于本事务提交则此处必可见）。历史单据与归因不受影响。
+        closing = _get_period_closing(conn, start, end)
+        if closing is not None and closing["status"] == "closed":
+            raise APIError(
+                409,
+                "period_closed",
+                f"period [{start.isoformat()}, {end.isoformat()}) is closed "
+                f"under close ref {closing['close_ref']}; issue rejected; "
+                f"release the closing before issuing supplements",
+                detail={
+                    "close_ref": closing["close_ref"],
+                    "closed_at": closing["closed_at"].isoformat(),
+                    "latest_batch_id": closing["latest_batch_id"],
+                },
+            )
+
         # 锁定期间内全部参与核算的更正链根：与争议开启/解除持有的链根锁互斥，
         # 保证重算所见的争议状态与入账状态一致（不重复出单、不漏算/错算争议链）。
         root_rows = conn.execute(PERIOD_CHAIN_ROOTS_SQL, (start, end)).fetchall()
@@ -589,7 +634,7 @@ def preview_period(conn, start_in: datetime, end_in: datetime):
     payable, pending, _chains = compute_current(conn, start, end)
     prior = _load_prior_payable(conn, start, end)
     latest = _latest_batch(conn, start, end)
-    return {
+    result = {
         "period_start": start,
         "period_end": end,
         "payable": [
@@ -604,6 +649,14 @@ def preview_period(conn, start_in: datetime, end_in: datetime):
         "pending": pending,
         "statement_exists": latest is not None,
     }
+    # 关账期间：试算照常只读，另附实时应付与关账应付的对照（差额实时 −
+    # 关账，可正可负）；未关账或已解除期间不附带该块，保持原约定。
+    from .closings_service import build_preview_closing
+
+    closing = build_preview_closing(conn, start, end, payable, pending)
+    if closing is not None:
+        result["closing"] = closing
+    return result
 
 
 def list_batches(conn, start_in: datetime, end_in: datetime):

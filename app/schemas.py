@@ -674,3 +674,57 @@ class PlayDisputeOut(BaseModel):
 
 # 解析 HolderLedger 中对 LedgerInstructionItem 的前向引用
 HolderLedger.model_rebuild()
+
+
+# ---- 财务期间关账（封存已出单期间）/ 解除 ----
+
+class PeriodCloseIn(PeriodParams):
+    # 调用方唯一关账号（全局唯一；同号同期间重试幂等、异期间复用 409）。
+    # 沿用期间字段 start/end（半开区间，必须带时区；end > start）。
+    close_ref: str = Field(min_length=1, max_length=200)
+
+
+class PeriodClosePayable(BaseModel):
+    holder_code: str
+    # 关账时该权利人在本期间全部已出单据的累计应付（代数和，可为负）
+    payable_total: int
+
+
+class PeriodCloseOut(BaseModel):
+    close_ref: str
+    period_start: datetime
+    period_end: datetime
+    # 关账时最后一张已出单据编号
+    latest_batch_id: int
+    # 关账时最近一次出具冻结的待处理数量
+    pending_count: int
+    # 请求级状态：created=本次关账；released=本次解除；
+    # duplicate=同号同期间重试或重复解除；查询时与 closing_status 一致
+    status: str
+    # 关账自身状态：closed=已关账 | released=已解除
+    closing_status: str
+    closed_at: datetime
+    released_at: datetime | None = None
+    # 各权利人累计应付快照（按权利人编号升序）
+    payables: list[PeriodClosePayable] = []
+
+
+# 试算响应中"实时应付 vs 关账应付"的逐权利人对照行
+class ClosingPreviewPayable(BaseModel):
+    holder_code: str
+    # 试算瞬间实时应付
+    current_payable: int
+    # 关账时冻结的累计应付
+    closed_payable: int
+    # 差额 = 实时应付 − 关账应付（可正可负）；关账期间无法出具追补，须先解除
+    difference: int
+
+
+class ClosingPreview(BaseModel):
+    close_ref: str
+    closing_status: str
+    closed_at: datetime
+    latest_batch_id: int
+    pending_count_closed: int
+    pending_count_current: int
+    payables: list[ClosingPreviewPayable] = []

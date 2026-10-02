@@ -634,6 +634,97 @@ DROP TRIGGER IF EXISTS balance_snapshot_lines_frozen_trg ON balance_snapshot_lin
 CREATE TRIGGER balance_snapshot_lines_frozen_trg
     BEFORE UPDATE OR DELETE ON balance_snapshot_lines
     FOR EACH ROW EXECUTE FUNCTION balance_snapshots_frozen();
+
+-- 财务期间关账（封存已出单期间）：
+-- 财务凭调用方唯一关账号 close_ref 与期间起止时间封存一个"已出单据"期间。
+--   closed   已关账：关账后该期间再次出单一律拒绝（出单事务在期间咨询锁下
+--                    先查本表，409 period_closed）；历史单据与归因保持冻结，
+--                    播放更正、协议登记、争议暂缓/解除照常进行。
+--   released 已解除：唯一允许的迁移（凭关账号解除，触发器强制）；解除后可按
+--                    既有规则出具追补单（追补差额相对关账时累计应付计算）。
+-- 关账快照固化"关账时最新单据号、各权利人累计应付（= 该期间全部已出单据明细
+-- 行的代数和）与待处理数量（最近一次出具冻结的待处理清单条数）"，保证关账
+-- 快照对应最后一张已出单据；关账、解除与出单均在同一"期间事务咨询锁"上
+-- 按期间串行，关账后不漏出单。
+-- close_ref 全局唯一：同号同期间重试返回原关账记录（status=duplicate）；
+-- 异期间复用、同期间重复关账（含不同关账号、解除后再关）均 409 拒绝且不留
+-- 记录；未知关账号解除/查询 404。
+CREATE TABLE IF NOT EXISTS period_closings (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    close_ref       text NOT NULL UNIQUE,
+    period_start    timestamptz NOT NULL,
+    period_end      timestamptz NOT NULL,
+    -- 关账时该期间最后一张已出单据（不可变；历史单据不可删除，FK 不会悬空）
+    latest_batch_id bigint NOT NULL REFERENCES statement_batches(id),
+    -- 关账时最近一次出具冻结的待处理清单条数（缺协议/争议待处理合计）
+    pending_count   integer NOT NULL CHECK (pending_count >= 0),
+    status          text NOT NULL DEFAULT 'closed'
+                    CHECK (status IN ('closed', 'released')),
+    closed_at       timestamptz NOT NULL DEFAULT now(),
+    released_at     timestamptz,
+    CONSTRAINT period_closings_range_chk CHECK (period_end > period_start)
+);
+-- 一个期间至多一条关账记录（解除后也不允许同期间再次关账；同期间重复关账
+-- 由应用层在期间咨询锁下先行拒绝，此唯一索引兜底，正常路径不会触发）。
+CREATE UNIQUE INDEX IF NOT EXISTS period_closings_period_uniq
+    ON period_closings(period_start, period_end);
+
+-- 各权利人累计应付快照行：关账时按该期间全部已出单据明细行代数和冻结，
+-- 每位权利人一行（含 0 额）；行一经写入即不可修改/删除。
+CREATE TABLE IF NOT EXISTS period_closing_lines (
+    closing_id        bigint NOT NULL REFERENCES period_closings(id) ON DELETE CASCADE,
+    holder_code       text NOT NULL,
+    -- 该权利人在本期间全部已出单据（初次单与正负追补单）的累计应付
+    payable_total     bigint NOT NULL,
+    PRIMARY KEY (closing_id, holder_code)
+);
+
+-- 关账头守卫：禁止删除；全部内容字段冻结，唯一允许的变更是
+-- closed -> released（仅 status 与 released_at 变化；应用层在持锁事务内完成）。
+CREATE OR REPLACE FUNCTION period_closings_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'period closings must not be deleted; history is immutable';
+    END IF;
+    IF OLD.status = 'closed'
+       AND NEW.status = 'released'
+       AND NEW.id IS NOT DISTINCT FROM OLD.id
+       AND NEW.close_ref IS NOT DISTINCT FROM OLD.close_ref
+       AND NEW.period_start IS NOT DISTINCT FROM OLD.period_start
+       AND NEW.period_end IS NOT DISTINCT FROM OLD.period_end
+       AND NEW.latest_batch_id IS NOT DISTINCT FROM OLD.latest_batch_id
+       AND NEW.pending_count IS NOT DISTINCT FROM OLD.pending_count
+       AND NEW.closed_at IS NOT DISTINCT FROM OLD.closed_at THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'period closing content is frozen and only a closed period '
+                  'may be released';
+END;
+$$;
+DROP TRIGGER IF EXISTS period_closings_guarded_trg ON period_closings;
+CREATE TRIGGER period_closings_guarded_trg
+    BEFORE UPDATE OR DELETE ON period_closings
+    FOR EACH ROW EXECUTE FUNCTION period_closings_guarded();
+
+-- 关账累计应付快照行一经写入即禁止修改/删除
+CREATE OR REPLACE FUNCTION period_closing_lines_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'period closing payable lines are frozen and must not be '
+                  || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS period_closing_lines_frozen_trg ON period_closing_lines;
+CREATE TRIGGER period_closing_lines_frozen_trg
+    BEFORE UPDATE OR DELETE ON period_closing_lines
+    FOR EACH ROW EXECUTE FUNCTION period_closing_lines_frozen();
 """
 
 
