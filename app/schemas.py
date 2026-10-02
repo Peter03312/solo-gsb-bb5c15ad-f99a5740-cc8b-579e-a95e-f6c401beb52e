@@ -248,6 +248,38 @@ class AttributionPage(BaseModel):
     records: list[AttributionRecord]
 
 
+# ---- 期间关账（封存已出单期间）----
+
+class PeriodCloseIn(PeriodParams):
+    # 调用方唯一关账号（全局唯一；同号同期间重试幂等、异期间复用 409）
+    close_ref: str = Field(min_length=1, max_length=200)
+
+
+class PeriodCloseLineOut(BaseModel):
+    holder_code: str
+    # 关账时该权利人该期间已出具单据的累计应付（正负追补代数和，整数分）
+    amount: int
+
+
+class PeriodCloseOut(BaseModel):
+    close_ref: str
+    # 请求级状态：created=本次关账；released=本次解除；
+    # duplicate=同号同期间重试或重复解除，返回原记录
+    status: str
+    # 关账记录自身状态：closed=封存中；released=已解除
+    close_status: str
+    period_start: datetime
+    period_end: datetime
+    # 关账时该期间最新一张已出单据号
+    last_batch_id: int
+    # 关账时该期间待处理播放数量
+    pending_count: int
+    # 各权利人累计应付（冻结值，不随后续流水变化）
+    payable: list[PeriodCloseLineOut]
+    closed_at: datetime
+    released_at: datetime | None = None
+
+
 # ---- 付款登记与对账 ----
 
 class PaymentIn(BaseModel):

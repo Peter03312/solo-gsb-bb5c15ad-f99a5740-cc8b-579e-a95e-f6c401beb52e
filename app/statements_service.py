@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from .allocation import allocate
 from .disputes_service import lock_chain_roots
+from .errors import APIError
 from .payments_service import lock_holders_for_billing
 
 # 咨询锁：使用单 bigint 键，高 32 位为服务命名空间、低 32 位为期间键
@@ -95,6 +96,19 @@ def _period_lock_key(key: str) -> int:
     n = int.from_bytes(digest, "big", signed=False)
     # 转成 int8 有符号数
     return n - (1 << 64) if n >= (1 << 63) else n
+
+
+def lock_period(conn, key: str) -> None:
+    """期间事务咨询锁：出单、关账与解除关账按同一期间键串行。
+
+    关账在持锁后读取"最后一张已出单据"并冻结快照，出单在持锁后先检查
+    期间是否已封存——三者互斥保证关账快照对应最后一张已出单据，
+    且关账后不会有出单漏入。
+    """
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(%s::bigint)",
+        (_combined_key(ADVISORY_NS, _period_lock_key(key)),),
+    )
 
 
 def _pending_payload(rows) -> list[dict]:
@@ -216,8 +230,12 @@ def _load_pending_snapshot(conn, start: datetime, end: datetime):
     return _pending_payload(rows)
 
 
-def _load_prior_payable(conn, start: datetime, end: datetime) -> dict[str, int]:
-    """此前全部单据明细行的累计额（= 已入账应付）。"""
+def load_period_payable(conn, start: datetime, end: datetime) -> dict[str, int]:
+    """该期间此前全部单据明细行的累计额（= 已入账应付）。
+
+    出单侧用作"此前累计额"（追补差额基准）；关账侧用作冻结的
+    "各权利人累计应付"。
+    """
     rows = conn.execute(
         """
         SELECT l.holder_code, COALESCE(SUM(l.amount), 0) AS total
@@ -309,6 +327,52 @@ def _latest_batch(conn, start: datetime, end: datetime):
         """,
         (start, end),
     ).fetchone()
+
+
+# ---- 期间关账（封存/解除由 closes_service 负责；此处为出单/试算侧的只读口径）----
+
+def load_active_close(conn, start: datetime, end: datetime):
+    """该期间当前未解除（closed）的关账记录；无则 None。"""
+    return conn.execute(
+        """
+        SELECT id, close_ref, last_batch_id, pending_count, closed_at
+        FROM period_closes
+        WHERE period_start = %s AND period_end = %s AND status = 'closed'
+        """,
+        (start, end),
+    ).fetchone()
+
+
+def load_close_payable(conn, close_id: int) -> dict[str, int]:
+    """关账冻结的各权利人累计应付（holder_code -> 整数分）。"""
+    rows = conn.execute(
+        "SELECT holder_code, payable_total FROM period_close_lines WHERE close_id = %s",
+        (close_id,),
+    ).fetchall()
+    return {r["holder_code"]: r["payable_total"] for r in rows}
+
+
+def _raise_if_period_closed(conn, start: datetime, end: datetime) -> None:
+    """期间已封存（未解除关账）时拒绝出单：409 period_closed，不留任何记录。"""
+    row = conn.execute(
+        """
+        SELECT close_ref FROM period_closes
+        WHERE period_start = %s AND period_end = %s AND status = 'closed'
+        """,
+        (start, end),
+    ).fetchone()
+    if row is not None:
+        raise APIError(
+            409,
+            "period_closed",
+            f"period [{start.isoformat()}, {end.isoformat()}) is sealed by "
+            f"period close {row['close_ref']}; issuing is rejected until it is released",
+            detail={
+                "close_ref": row["close_ref"],
+                "period_start": start.isoformat(),
+                "period_end": end.isoformat(),
+            },
+        )
 
 
 def _insert_batch(conn, start, end, kind, supersedes, lines: dict[str, int]):
@@ -505,10 +569,12 @@ def issue_statement(conn, start_in: datetime, end_in: datetime):
     start, end, key = canonical_period(start_in, end_in)
     with conn.transaction():
         # 同一期间串行化出具，杜绝并发重复单据与重复证据
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(%s::bigint)",
-            (_combined_key(ADVISORY_NS, _period_lock_key(key)),),
-        )
+        # （关账/解除关账也在同一期间锁上串行）
+        lock_period(conn, key)
+
+        # 期间已封存（未解除关账）：拒绝出单，不留任何记录；
+        # 历史单据与归因保持冻结，解除后方可按追补规则继续出具。
+        _raise_if_period_closed(conn, start, end)
 
         # 锁定期间内全部参与核算的更正链根：与争议开启/解除持有的链根锁互斥，
         # 保证重算所见的争议状态与入账状态一致（不重复出单、不漏算/错算争议链）。
@@ -543,7 +609,7 @@ def issue_statement(conn, start_in: datetime, end_in: datetime):
             return _build_response(batch, start, end, payable, {}, pending)
 
         # 已有单据：不可覆盖，按新应付额与此前累计额之差出具追补单（差额可正可负）
-        prior = _load_prior_payable(conn, start, end)
+        prior = load_period_payable(conn, start, end)
         holders = set(payable) | set(prior)
         deltas = {
             h: payable.get(h, 0) - prior.get(h, 0)
@@ -584,25 +650,56 @@ def issue_statement(conn, start_in: datetime, end_in: datetime):
 
 
 def preview_period(conn, start_in: datetime, end_in: datetime):
-    """不出具，仅按当前数据试算。"""
+    """不出具，仅按当前数据试算。
+
+    期间处于封存（未解除关账）时，额外展示关账冻结口径：
+    逐权利人附 closed_amount（关账时累计应付）与 closed_delta
+    （实时应付 − 关账应付，可正可负），并回带关账记录要点；
+    关账期间播放更正/协议登记/争议操作照常，试算始终按实时数据重算。
+    """
     start, end, _ = canonical_period(start_in, end_in)
     payable, pending, _chains = compute_current(conn, start, end)
-    prior = _load_prior_payable(conn, start, end)
+    prior = load_period_payable(conn, start, end)
     latest = _latest_batch(conn, start, end)
+
+    close = load_active_close(conn, start, end)
+    closed_payable: dict[str, int] = {}
+    if close is not None:
+        closed_payable = load_close_payable(conn, close["id"])
+
+    holders = set(payable) | set(prior) | set(closed_payable)
+    lines = []
+    for h in sorted(holders):
+        current = payable.get(h, 0)
+        line = {
+            "holder_code": h,
+            "amount": current,
+            "delta": (current - prior.get(h, 0))
+            if latest is not None else None,
+            # 封存期间：关账冻结的累计应付与"实时应付 − 关账应付"差额
+            "closed_amount": closed_payable.get(h, 0) if close is not None else None,
+            "closed_delta": (current - closed_payable.get(h, 0))
+            if close is not None else None,
+        }
+        lines.append(line)
+
     return {
         "period_start": start,
         "period_end": end,
-        "payable": [
-            {
-                "holder_code": h,
-                "amount": payable.get(h, 0),
-                "delta": (payable.get(h, 0) - prior.get(h, 0))
-                if latest is not None else None,
-            }
-            for h in sorted(set(payable) | set(prior))
-        ],
+        "payable": lines,
         "pending": pending,
         "statement_exists": latest is not None,
+        # 封存期间为 True 并回带关账记录要点；未封存（或已解除）为 False/None
+        "period_closed": close is not None,
+        "period_close": (
+            {
+                "close_ref": close["close_ref"],
+                "last_batch_id": close["last_batch_id"],
+                "pending_count": close["pending_count"],
+                "closed_at": close["closed_at"],
+            }
+            if close is not None else None
+        ),
     }
 
 

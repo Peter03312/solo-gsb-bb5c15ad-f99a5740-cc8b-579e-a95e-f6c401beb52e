@@ -634,6 +634,96 @@ DROP TRIGGER IF EXISTS balance_snapshot_lines_frozen_trg ON balance_snapshot_lin
 CREATE TRIGGER balance_snapshot_lines_frozen_trg
     BEFORE UPDATE OR DELETE ON balance_snapshot_lines
     FOR EACH ROW EXECUTE FUNCTION balance_snapshots_frozen();
+
+-- 期间关账（财务封存已出单期间）：
+-- 财务凭"期间起止 + 调用方唯一关账号 close_ref"封存一个已出单期间。
+-- 关账时冻结：最新单据号 last_batch_id、各权利人累计应付（明细行表）、
+-- 待处理数量 pending_count；此后该期间在解除前拒绝再次出单，
+-- 历史单据与归因保持不变（本就冻结），播放更正/协议登记/争议操作照常。
+--   closed   封存中：同一期间至多一条（部分唯一索引强制）；
+--   released 已解除：终态，只允许 closed -> released（触发器强制）；
+--                    解除后该期间可按既有规则出具追补，重复解除幂等。
+-- close_ref 全局唯一：同号同期间重试幂等返回原关账记录，
+-- 同号异期间复用拒绝（409）；同期间重复关账（新号）拒绝（409）。
+CREATE TABLE IF NOT EXISTS period_closes (
+    id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    close_ref     text NOT NULL UNIQUE,
+    period_start  timestamptz NOT NULL,
+    period_end    timestamptz NOT NULL,
+    status        text NOT NULL DEFAULT 'closed'
+                  CHECK (status IN ('closed', 'released')),
+    -- 关账时该期间最新一张已出单据（快照锚点：关账与出单按期间串行，
+    -- 保证其确为封存瞬间的最后一张单据）
+    last_batch_id bigint NOT NULL REFERENCES statement_batches(id),
+    -- 关账时该期间待处理播放数量（取自最后一次出单刷新的待处理快照）
+    pending_count integer NOT NULL CHECK (pending_count >= 0),
+    closed_at     timestamptz NOT NULL DEFAULT now(),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    released_at   timestamptz,
+    CONSTRAINT period_closes_period_chk CHECK (period_end > period_start)
+);
+-- 同一期间至多一条未解除关账（并发关账在此兜底，正常路径期间锁下先行拒绝）
+CREATE UNIQUE INDEX IF NOT EXISTS period_closes_one_closed_per_period
+    ON period_closes(period_start, period_end)
+    WHERE status = 'closed';
+-- 出单/试算按期间反查未解除关账的主查询索引
+CREATE INDEX IF NOT EXISTS period_closes_period_idx
+    ON period_closes(period_start, period_end, status);
+
+-- 关账冻结明细：每位权利人一行，固化关账时该期间已出具单据的累计应付
+-- （初次单与历次正负追补单的代数和，整数分，可为负）。
+CREATE TABLE IF NOT EXISTS period_close_lines (
+    close_id      bigint NOT NULL REFERENCES period_closes(id) ON DELETE CASCADE,
+    holder_code   text NOT NULL,
+    payable_total bigint NOT NULL,
+    PRIMARY KEY (close_id, holder_code)
+);
+
+-- 关账头守卫：禁止删除；内容字段冻结，唯一允许的变更是 closed -> released
+-- （仅 status 与 released_at 变化）。应用层在持锁事务内完成解除。
+CREATE OR REPLACE FUNCTION period_closes_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'period closes must not be deleted; history is immutable';
+    END IF;
+    IF OLD.status = 'closed'
+       AND NEW.status = 'released'
+       AND NEW.id IS NOT DISTINCT FROM OLD.id
+       AND NEW.close_ref IS NOT DISTINCT FROM OLD.close_ref
+       AND NEW.period_start IS NOT DISTINCT FROM OLD.period_start
+       AND NEW.period_end IS NOT DISTINCT FROM OLD.period_end
+       AND NEW.last_batch_id IS NOT DISTINCT FROM OLD.last_batch_id
+       AND NEW.pending_count IS NOT DISTINCT FROM OLD.pending_count
+       AND NEW.closed_at IS NOT DISTINCT FROM OLD.closed_at
+       AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'period close content is frozen and only closed periods may be released';
+END;
+$$;
+DROP TRIGGER IF EXISTS period_closes_guarded_trg ON period_closes;
+CREATE TRIGGER period_closes_guarded_trg
+    BEFORE UPDATE OR DELETE ON period_closes
+    FOR EACH ROW EXECUTE FUNCTION period_closes_guarded();
+
+-- 关账冻结明细一经写入即禁止修改/删除（级联删除关账头除外）
+CREATE OR REPLACE FUNCTION period_close_lines_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'period close frozen lines must not be ' || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS period_close_lines_frozen_trg ON period_close_lines;
+CREATE TRIGGER period_close_lines_frozen_trg
+    BEFORE UPDATE OR DELETE ON period_close_lines
+    FOR EACH ROW EXECUTE FUNCTION period_close_lines_frozen();
 """
 
 

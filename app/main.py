@@ -10,6 +10,7 @@ from .routers import (
     balance_snapshots,
     catalog,
     payments,
+    period_closes,
     play_disputes,
     plays,
     receipts,
@@ -28,7 +29,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="演出录音播放版税结算服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "登记作品与分成协议、导入播放记录（支持幂等与更正链）、"
         "按播放发生时间匹配协议并逐笔按比例分摊，按期间出具应付/追补单据，"
@@ -42,7 +43,10 @@ app = FastAPI(
         "待确认预留/余额/可用额，同集合幂等、异集合拒绝、分页读取、历史不改写），"
         "并对播放更正链登记计费争议暂缓（凭链内任一播放编号/唯一争议号/原因，"
         "作用于整条链、后续更正自动继承，试算与出单把链尾列为争议待处理而不计应付；"
-        "凭争议号解除，幂等重试、同链重复开启拒绝，解除后按最新链尾与协议恢复）。"
+        "凭争议号解除，幂等重试、同链重复开启拒绝，解除后按最新链尾与协议恢复），"
+        "并支持期间关账（凭期间起止与唯一关账号封存已出单期间，冻结最新单号、"
+        "各权利人累计应付与待处理数量；封存期间拒绝出单，试算展示实时应付与"
+        "关账应付差额；凭关账号解除后按追补规则恢复出单，幂等与冲突拒绝不留记录）。"
     ),
     lifespan=lifespan,
 )
@@ -56,6 +60,7 @@ app.include_router(reservations.router)
 app.include_router(refunds.router)
 app.include_router(receipts.router)
 app.include_router(balance_snapshots.router)
+app.include_router(period_closes.router)
 
 
 @app.get("/health", tags=["system"])

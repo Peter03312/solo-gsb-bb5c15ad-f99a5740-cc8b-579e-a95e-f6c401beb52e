@@ -142,6 +142,26 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - 争议头与开启/解除操作记录 **只追加、不可修改/删除**（触发器强制，
     唯一允许的变更是 open → released）；现有播放导入、更正、出单与付款
     **接口契约保持不变**（待处理项仅新增 `reason_code`/`dispute_ref` 字段）。
+- **期间关账（财务封存已出单期间）**：
+  - 财务凭 **期间起止时间 + 调用方唯一关账号 `close_ref`** 封存一个已出单期间，
+    冻结并返回 **关账时最新单号 `last_batch_id`、各权利人累计应付
+    （该期间全部已出具单据的正负累计）与待处理数量 `pending_count`**；
+    **无已出单据的期间拒绝关账**（409 `period_not_billed`），不留任何记录；
+  - **关账后该期间再次出单一律拒绝**（409 `period_closed`）；
+    **历史单据与逐笔归因保持不变**；播放更正、协议登记与争议操作 **照常进行**；
+    **试算（preview）展示实时应付及其与关账应付的差额**
+    （逐权利人 `closed_amount`/`closed_delta`，并回带关账要点 `period_close`）；
+  - **凭关账号解除**（`closed → released`）后该期间可按 **既有规则出具追补单**；
+    **重复解除幂等**（200 `duplicate`）；解除后可用 **新关账号** 再次关账；
+  - **同号同期间重试返回原关账记录**（`status=duplicate`，HTTP 200，
+    已解除的同样返回原记录、不复活）；**同号异期间复用 409 `close_ref_conflict`、
+    同期间重复关账（含换新关账号）409 `period_already_closed`、
+    未知关账号解除/查询 404 `period_close_not_found`**，拒绝均 **不留记录**；
+  - **关账、解除与出单按期间串行**（关账号事务咨询锁 → 期间事务咨询锁，
+    与出单同一把期间锁）：关账快照 **对应最后一张已出单据**，
+    **关账后不漏出单**；普通期间（未封存）的出单、查询仍按现有约定执行；
+  - 关账头与冻结明细 **一经写入不可修改/删除**（触发器强制，
+    唯一允许的变更是 closed → released）。
 
 ## 一键启动
 
@@ -273,6 +293,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/play-disputes` | 凭链内任一播放编号 + 唯一争议号 + 原因登记暂缓（整链）；新登记 201，同号同内容重试 200，异内容 409，未知播放 404，同链重复开启 409 |
 | POST | `/play-disputes/{dispute_ref}/release` | 凭争议号解除；重复解除幂等 200；未知争议号 404 |
 | GET | `/play-disputes/{dispute_ref}` | 查询：原始编号、登记编号、当前链尾、状态、原因与开启/解除操作记录；未知争议号 404 |
+
+### 期间关账（封存/解除）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/period-closes` | 凭期间起止 + 唯一关账号封存已出单期间（冻结最新单号、各权利人累计应付与待处理数量）；新关账 201，同号同期间重试 200，异期间复用 409，同期间重复关账 409，无已出单据 409 |
+| POST | `/period-closes/{close_ref}/release` | 凭关账号解除封存（解除后按既有规则出具追补）；重复解除幂等 200；未知关账号 404 |
+| GET | `/period-closes/{close_ref}` | 按关账号查询关账记录（期间、状态、最新单号、待处理数量与冻结的各权利人累计应付）；未知关账号 404 |
 
 `POST /payments` 请求体：
 
@@ -652,6 +680,74 @@ balance >= SUM(更早 pending 预留) + 本指令金额
   `statement_line_amount`（原单据明细行金额）与 `reconciles`（两者是否相等）；
 - `traceable=false`：存量不可追溯单据，`records` 为空、`reconciles` 恒为 false。
 
+#### 期间关账（封存已出单期间）
+
+`POST /period-closes` 请求体：
+
+```json
+{
+  "close_ref": "CLOSE-202602",
+  "start": "2026-02-01T00:00:00+08:00",
+  "end": "2026-03-01T00:00:00+08:00"
+}
+```
+
+- `close_ref` 为调用方提供的**唯一关账号**（全局唯一）；期间为半开区间
+  `[start, end)`，须带时区，与出单期间语义一致。
+- 仅可封存 **已有已出单据** 的期间；关账时冻结并返回 **最新单号
+  `last_batch_id`、各权利人累计应付 `payable[]`（该期间全部已出具单据
+  明细的正负累计，整数分）与待处理数量 `pending_count`**。
+  成功响应（201，`status=created`）：
+
+```json
+{
+  "close_ref": "CLOSE-202602",
+  "status": "created",
+  "close_status": "closed",
+  "period_start": "2026-01-31T16:00:00Z",
+  "period_end": "2026-02-28T16:00:00Z",
+  "last_batch_id": 1,
+  "pending_count": 1,
+  "payable": [
+    {"holder_code": "RS-A", "amount": 63},
+    {"holder_code": "RS-B", "amount": 30},
+    {"holder_code": "RS-C", "amount": 7}
+  ],
+  "closed_at": "2026-02-28T16:05:00Z",
+  "released_at": null
+}
+```
+
+- **同号同期间重试**：HTTP 200、`status="duplicate"`，返回原关账记录
+  （`closed_at` 与全部冻结值不变；该关账已解除时也返回原记录、不复活）；
+- **同号异期间复用**：409 `close_ref_conflict`（`detail` 回显新旧期间）；
+- **同期间已有未解除关账**（含换新关账号）：409 `period_already_closed`
+  （`detail.existing_close_ref` 回显在先关账号）；
+- **无已出单据**：409 `period_not_billed`；上述拒绝均 **不留任何记录**。
+- 关账后该期间 **再次出单一律 409 `period_closed`**（`detail.close_ref`
+  回显关账号）；历史单据与归因保持不变，播放更正、协议登记与争议操作照常。
+- 封存期间试算（`GET /statements/preview`）额外返回：`period_closed=true`、
+  `period_close`（关账号/最新单号/待处理数量/关账时间），且逐权利人附
+  `closed_amount`（关账时累计应付）与 `closed_delta`
+  （**实时应付 − 关账应付**，可正可负）；未封存期间这些字段为 `false`/`null`。
+
+解除封存：`POST /period-closes/{close_ref}/release`
+
+- `closed → released`，返回原关账记录（`status="released"`、
+  `released_at` 落戳）；**解除后该期间可按既有规则出具追补单**，
+  历史单据、归因与关账冻结快照均不变；
+- **重复解除幂等**：HTTP 200、`status="duplicate"`，原记录状态不变；
+- **未知关账号**：404 `period_close_not_found`（查询接口同），不留记录；
+- 解除后可用 **新关账号** 再次关账（快照锚定届时最新单据）。
+
+`GET /period-closes/{close_ref}` 返回与创建响应同形的关账记录
+（`status` 即记录自身状态），冻结的各权利人累计应付不随后续流水变化。
+
+> 并发约定：关账/解除按「关账号事务咨询锁 → 期间事务咨询锁」加锁，
+> 与出单共用同一把期间锁——关账快照必然对应 **封存瞬间最后一张已出单据**，
+> 关账提交后出单请求一律拒绝（**不漏出单**），解除提交后出单恢复；
+> 普通期间（未封存）的出单、查询完全按现有约定执行。
+
 ## 调用示例
 
 一键演示脚本（请先启动服务），覆盖幂等、异内容拒绝、区间重叠、更正链/分叉拒绝、
@@ -991,6 +1087,56 @@ curl -sS -i -X POST http://localhost:8000/payment-reservations/CMD-2/confirm \
 curl -sS http://localhost:8000/rightsholders/RS-R/ledger | python3 -m json.tool
 ```
 
+财务月末封存已出单期间（关账；承上：2026 年 2 月已出初次单，RS-A/RS-B/RS-C 各 63/30/7 分）：
+
+```bash
+# 自包含演示脚本：出单/关账/封存期拒绝出单/试算差额/解除/追补 全流程
+BASE=http://localhost:8000 bash examples/period_closes_demo.sh
+```
+
+手工调用关键几步：
+
+```bash
+# 1) 关账：期间起止 + 唯一关账号（201；冻结最新单号、各权利人累计应付与待处理数量）
+curl -sS -X POST http://localhost:8000/period-closes -H 'Content-Type: application/json' \
+  -d '{"close_ref":"CLOSE-202602",
+       "start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' \
+  | python3 -m json.tool
+
+# 2) 同号同期间重试 => 200 status=duplicate 返回原记录；
+#    同号异期间 => 409 close_ref_conflict；同期间重复关账 => 409 period_already_closed；
+#    无已出单据期间 => 409 period_not_billed（均不留记录）
+curl -sS -i -X POST http://localhost:8000/period-closes -H 'Content-Type: application/json' \
+  -d '{"close_ref":"CLOSE-202602",
+       "start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | head -1
+curl -sS -i -X POST http://localhost:8000/period-closes -H 'Content-Type: application/json' \
+  -d '{"close_ref":"CLOSE-202602",
+       "start":"2026-03-01T00:00:00+08:00","end":"2026-04-01T00:00:00+08:00"}' | head -1
+curl -sS -i -X POST http://localhost:8000/period-closes -H 'Content-Type: application/json' \
+  -d '{"close_ref":"CLOSE-202602-2",
+       "start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | head -1
+
+# 3) 封存期间再次出单 => 409 period_closed；更正/协议/争议照常；
+#    试算展示实时应付与关账应付差额（closed_amount/closed_delta）
+curl -sS -i -X POST http://localhost:8000/statements/issue \
+  -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' | head -1
+curl -sS "http://localhost:8000/statements/preview?start=2026-02-01T00:00:00%2B08:00&end=2026-03-01T00:00:00%2B08:00" \
+  | python3 -m json.tool
+
+# 4) 凭关账号解除（200 released；重复解除幂等 duplicate；未知关账号 404）
+curl -sS -X POST http://localhost:8000/period-closes/CLOSE-202602/release | python3 -m json.tool
+curl -sS -i -X POST http://localhost:8000/period-closes/CLOSE-202602/release | head -1
+curl -sS -i -X POST http://localhost:8000/period-closes/NO-SUCH-CLOSE/release | head -1
+
+# 5) 解除后按既有规则出具追补单；按关账号查询冻结快照（不随后续流水变化）
+curl -sS -X POST http://localhost:8000/statements/issue \
+  -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' \
+  | python3 -m json.tool
+curl -sS http://localhost:8000/period-closes/CLOSE-202602 | python3 -m json.tool
+```
+
 ## 分摊示例
 
 金额 100，比例 62.5% / 30% / 7.5%：
@@ -1030,7 +1176,12 @@ python3 -m unittest discover -s tests -v
 未知播放 404/同链重复开启 409 状态不变/重复解除幂等/解除后新号重开/
 暂缓整链争议待处理不计应付且后续更正继承/争议优先于缺协议/
 已出单据与归因冻结再出单追补撤销/解除后按最新链尾恢复无变化不出新单/
-争议操作与出单并发基于一致已提交状态不重复出单不漏算）
+争议操作与出单并发基于一致已提交状态不重复出单不漏算）、
+期间关账（无已出单据拒绝/冻结最新单号与各权利人累计应付及待处理数量/
+同号同期间幂等同号异期间 409/同期间重复关账 409/未知关账号 404 均不留记录/
+封存期出单拒绝且历史单据归因不变/更正协议争议照常/试算实时与关账应付差额/
+解除幂等且解除后按追补规则出单/旧号不复活新号可再关账/
+关账解除与出单按期间串行快照锚定最后一张单据关账后不漏出单/触发器不可变）
 各有一套：
 
 ```bash
@@ -1043,6 +1194,7 @@ PYTHONPATH=. python3 tests/integration_refunds.py               # 银行退票�
 PYTHONPATH=. python3 tests/integration_receipts.py              # 银行回单批次导入与付款核验
 PYTHONPATH=. python3 tests/integration_balance_snapshots.py     # 余额核对底稿一次性冻结
 PYTHONPATH=. python3 tests/integration_disputes.py              # 播放更正链计费争议暂缓/解除
+PYTHONPATH=. python3 tests/integration_period_closes.py         # 期间关账封存/解除
 ```
 
 ## 目录结构
@@ -1061,6 +1213,7 @@ app/
   receipts_service.py     # 回单批次导入（幂等/整批拒绝/跨批次去重）、核验结论与累计退回额冻结、复核版本化
   balance_snapshots_service.py  # 余额核对底稿一次性冻结（快照号锁 + 单语句已提交视图；同集合幂等/异集合拒绝、分页）
   disputes_service.py     # 播放更正链计费争议（争议号锁→链根锁；登记暂缓/解除幂等/同链重复开启拒绝；链锚定整链）
+  closes_service.py       # 期间关账（关账号锁→期间锁；封存已出单期间/解除幂等/异期间复用与重复关账拒绝；快照锚定最后一张单据）
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
@@ -1071,8 +1224,10 @@ app/
     refunds.py            # 银行退票登记
     receipts.py           # 回单批次导入、复核、版本查询
     balance_snapshots.py  # 余额核对底稿：冻结 / 分页读取
+    period_closes.py      # 期间关账：封存 / 解除 / 按关账号查询
 examples/demo.sh          # 端到端 curl 示例（含付款额度预留两阶段与负额追补 FIFO）
 examples/disputes_demo.sh # 播放更正链计费争议暂缓/解除端到端 curl 示例
-tests/                    # 单元测试与八套 pgserver 端到端集成测试
+examples/period_closes_demo.sh # 期间关账封存/解除端到端 curl 示例
+tests/                    # 单元测试与九套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```
